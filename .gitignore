@@ -47,9 +47,6 @@ server/.venv/
 __pycache__/
 .pytest_cache/
 
-# supabase local
-supabase/.temp/
-supabase/.branches/
 
 # секреты (локальные и прод) — хранятся на диске, не в git
 docs/secrets/
