@@ -1,0 +1,9 @@
+.git
+.github
+node_modules
+dist
+build
+.plasmo
+.env*
+*.pem
+*.tsbuildinfo

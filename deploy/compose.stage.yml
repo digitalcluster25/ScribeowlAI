@@ -1,0 +1,11 @@
+services:
+  scribeowl:
+    image: scribeowl:stage
+    container_name: scribeowl-stage
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.scribeowl-stage.rule=Host(`scribe.spaces.community`)"
+      - "traefik.http.routers.scribeowl-stage.entrypoints=websecure"
+      - "traefik.http.routers.scribeowl-stage.tls.certresolver=letsencrypt"
+      - "traefik.http.services.scribeowl-stage.loadbalancer.server.port=3000"

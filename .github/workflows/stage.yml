@@ -1,0 +1,46 @@
+name: Stage
+
+on:
+  pull_request:
+    branches: [stage]
+  push:
+    branches: [stage]
+  workflow_dispatch:
+
+concurrency:
+  group: stage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build application image
+        run: docker build -t scribeowl:stage .
+      - name: Package image
+        if: github.event_name != 'pull_request'
+        run: docker save scribeowl:stage | gzip -1 > scribeowl-stage.tar.gz
+      - name: Configure SSH
+        if: github.event_name != 'pull_request'
+        env:
+          DEPLOY_KEY: ${{ secrets.STAGE_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.STAGE_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+      - name: Deploy to stage server
+        if: github.event_name != 'pull_request'
+        run: |
+          ssh root@69.62.121.157 'install -d -m 755 /opt/scribeowl'
+          scp scribeowl-stage.tar.gz deploy/compose.stage.yml root@69.62.121.157:/opt/scribeowl/
+          ssh root@69.62.121.157 'docker load -i /opt/scribeowl/scribeowl-stage.tar.gz && docker compose -f /opt/scribeowl/compose.stage.yml up -d --force-recreate && rm /opt/scribeowl/scribeowl-stage.tar.gz'
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error https://scribe.spaces.community/healthz; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
