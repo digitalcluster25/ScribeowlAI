@@ -23,6 +23,7 @@ Docker Desktop — нужен для локального Supabase (https://www.
 - `pnpm` — зависимости и сборка фронта.
 
 ## 2. Сервер (FastAPI)
+Код сервера — отдельный репозиторий [ScribeowlAI_server](https://github.com/digitalcluster25/ScribeowlAI_server) (папка `server/` рядом с `client/`).
 ```bash
 cd server
 cp .env.example .env      # заполнить Supabase и (опционально) TRANSCRIPTAPI_API_KEY
@@ -71,53 +72,19 @@ pnpm build
 
 Для превью в Claude Desktop команды лежат в `.claude/launch.json` (`api`, `web`).
 
-## 4. Supabase локально
-Порты сдвинуты на `553xx` в `supabase/config.toml` (по умолчанию `543xx` заняты другим локальным проектом Supabase).
+## 4. База данных (Supabase)
+Схема БД и миграции живут в серверном репозитории
+[ScribeowlAI_server](https://github.com/digitalcluster25/ScribeowlAI_server) → `supabase/`
+(перенесены туда из этого репозитория 2026-09-25). Запуск, миграции и проверка схемы — в README сервера.
 
 ```bash
-cd ~/Development/Projects/ScribeowlAI
-supabase start            # первый запуск тянет образы, ~2-3 мин
-supabase status           # URL и ключи
-supabase status -o env    # то же в формате env
-supabase stop             # остановить (данные сохраняются)
+cd ../server            # папка серверного репозитория рядом с client/
+supabase start          # локальный стек в Docker, порты 553xx
 ```
 
-URL после запуска:
-- API: http://127.0.0.1:55321
-- Studio: http://127.0.0.1:55323
-- Postgres: `postgresql://postgres:postgres@127.0.0.1:55322/postgres`
-- Mailpit (письма Auth): http://127.0.0.1:55324
+Что нужно фронту из запущенного стека (значения — `supabase status -o env`, в `.env.local`):
+- `VITE_SUPABASE_URL` = API: http://127.0.0.1:55321
+- `VITE_SUPABASE_PUBLISHABLE_KEY` = `PUBLISHABLE_KEY` (публичный)
+- Studio: http://127.0.0.1:55323 · письма Auth (Mailpit): http://127.0.0.1:55324
 
 Ключи и полный вывод `supabase status` — в `docs/secrets/supabase-local.md` (папка в `.gitignore`).
-
-Переменные для `server/.env` (см. `server/.env.example`):
-- `SUPABASE_URL` = `API_URL`
-- `SUPABASE_ANON_KEY` = `PUBLISHABLE_KEY` (`sb_publishable_...`; legacy-эквивалент `ANON_KEY`)
-- `SUPABASE_SERVICE_ROLE_KEY` = `SECRET_KEY` (`sb_secret_...`; legacy-эквивалент `SERVICE_ROLE_KEY`), только на сервере
-
-Проверка:
-```bash
-curl -s http://127.0.0.1:55321/auth/v1/health -H "apikey: <SUPABASE_ANON_KEY>"
-# {"version":"v2.196.0","name":"GoTrue",...}
-```
-
-Схема БД — в `supabase/migrations/`, см. раздел 5.
-
-## 5. Миграции
-Миграции лежат в `supabase/migrations/<timestamp>_<name>.sql` и применяются по порядку.
-
-```bash
-cd ~/Development/Projects/ScribeowlAI
-supabase migration new <name>      # создать пустой файл миграции с текущим timestamp
-supabase db reset                  # пересоздать локальную БД и применить все миграции (данные стираются)
-supabase migration list --local    # какие миграции применены локально
-```
-
-`psql` на Mac не нужен, можно ходить в базу через контейнер:
-```bash
-docker exec -it supabase_db_ScribeowlAI psql -U postgres -d postgres
-```
-
-Правила:
-- Любое изменение схемы — только новой миграцией (`supabase migration new`). Уже существующие файлы миграций не редактировать: они могли быть применены у других разработчиков или на проде.
-- Доступ к таблицам: RLS включён везде, политик нет, права у `anon` и `authenticated` отозваны. С публичным ключом REST отвечает `42501 permission denied`. Работает только сервер с `SUPABASE_SERVICE_ROLE_KEY` (secret key).
