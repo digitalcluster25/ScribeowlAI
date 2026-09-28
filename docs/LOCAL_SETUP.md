@@ -89,7 +89,7 @@ supabase start          # локальный стек в Docker, порты 553x
 
 Ключи и полный вывод `supabase status` — в `docs/secrets/supabase-local.md` (папка в `.gitignore`).
 
-## 6. Stage (VPS) — доставка фронта
+## 5. Stage (VPS) — доставка фронта
 Переменные одинаковые везде, различаются значения:
 
 | Переменная | Локально (`.env.local`, не в git) | Stage (GitHub Secrets) |
