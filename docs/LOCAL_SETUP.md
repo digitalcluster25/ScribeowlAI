@@ -121,3 +121,19 @@ docker exec -it supabase_db_ScribeowlAI psql -U postgres -d postgres
 Правила:
 - Любое изменение схемы — только новой миграцией (`supabase migration new`). Уже существующие файлы миграций не редактировать: они могли быть применены у других разработчиков или на проде.
 - Доступ к таблицам: RLS включён везде, политик нет, права у `anon` и `authenticated` отозваны. С публичным ключом REST отвечает `42501 permission denied`. Работает только сервер с `SUPABASE_SERVICE_ROLE_KEY` (secret key).
+
+## 6. Stage (VPS) — доставка фронта
+Переменные одинаковые везде, различаются значения:
+
+| Переменная | Локально (`.env.local`, не в git) | Stage (GitHub Secrets) |
+|---|---|---|
+| `VITE_API_URL` | `http://127.0.0.1:8000` | `STAGE_VITE_API_URL` |
+| `VITE_SUPABASE_URL` | `http://127.0.0.1:55321` | `STAGE_VITE_SUPABASE_URL` |
+| `VITE_SUPABASE_PUBLISHABLE_KEY` | `supabase status` → `PUBLISHABLE_KEY` | `STAGE_VITE_SUPABASE_PUBLISHABLE_KEY` |
+
+- Новому разработчику ключи stage не нужны: они только в GitHub Secrets и попадают в сборку в CI.
+- Образ: `Dockerfile` → статика в nginx (порт 3000, `/healthz`), без Node/ffmpeg в рантайме. Тесты — `docker build --target test .`.
+- CI/CD: `.github/workflows/stage.yml` — PR в `stage`: тесты + сборка; push в `stage`: сборка с секретами → образ по SSH на VPS →
+  `docker compose up` → проверка `https://scribe.spaces.community/healthz`. Маршрут Traefik: `deploy/compose.stage.yml`.
+- Бэкенд и БД деплоятся из `ScribeowlAI_server` (свой workflow; env-файлы на VPS пишутся из его GitHub Secrets).
+
