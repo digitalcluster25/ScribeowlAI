@@ -4,4 +4,10 @@ allowBuilds:
   lmdb: true
   msgpackr-extract: true
   sharp: true
-  yt-dlp-exec: set this to true or false
+minimumReleaseAgeExclude:
+  - '@supabase/auth-js@2.117.2'
+  - '@supabase/functions-js@2.117.2'
+  - '@supabase/postgrest-js@2.117.2'
+  - '@supabase/realtime-js@2.117.2'
+  - '@supabase/storage-js@2.117.2'
+  - '@supabase/supabase-js@2.117.2'

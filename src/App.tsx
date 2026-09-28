@@ -33,15 +33,39 @@ import {
   Pencil2Icon,
   PersonIcon
 } from "@radix-ui/react-icons"
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react"
+
+import {
+  ApiError,
+  fetchTranscript,
+  fetchTranscriptProviders,
+  streamAi,
+  translateBatch,
+  type TranscriptProviderInfo
+} from "./api"
+import { useSession } from "./auth"
+import { Markdown } from "./Markdown"
+import { findActiveIndex } from "./player/clock"
+import { DebugPanel } from "./player/DebugPanel"
+import { recordHighlight } from "./player/debugStats"
+import { usePlayerClock } from "./player/usePlayerClock"
+import { embedUrl } from "./player/youtube"
+import { ProfilePage } from "./profile/ProfilePage"
+import { buildTimedTranscript } from "./timestamps"
+import { planBatches } from "./translation/batches"
+import { languageByCode } from "./translation/languages"
+import { TranslatePicker } from "./translation/TranslatePicker"
 
 type Panel = "summary" | "transcript" | "chat"
-type Message = { role: "user" | "assistant"; text: string }
+/** at — время отправки/ответа (ms). У сообщений, созданных до этой версии, его нет. */
+type Message = { role: "user" | "assistant"; text: string; at?: number }
 type TranscriptSegment = {
   start: number
   end: number
-  speaker: string
+  speaker?: string
   text: string
+  /** время оценено провайдером приблизительно (только метка абзаца) */
+  approximate?: boolean
 }
 type VideoItem = {
   id: string
@@ -51,110 +75,15 @@ type VideoItem = {
   transcriptSegments?: TranscriptSegment[]
   summary: string
   transcriptStatus: string
+  /** какой транскрипт-провайдер отдал текст */
+  transcriptProvider?: string
+  transcriptLanguage?: string
+  /** переводы фраз по коду языка: индекс = индекс фразы в транскрипте */
+  translations?: Record<string, (string | null)[]>
+  /** какой перевод показывать (null — без перевода) */
+  translationLang?: string | null
   messages: Message[]
 }
-type Provider = {
-  id: string
-  name: string
-  models: string[]
-  canChat: boolean
-  canTranscribe: boolean
-}
-
-declare global {
-  interface Window {
-    YT?: {
-      Player: new (
-        element: HTMLIFrameElement,
-        options: {
-          events: {
-            onReady: (event: { target: YouTubePlayer }) => void
-            onStateChange: (event: { data: number }) => void
-          }
-        }
-      ) => YouTubePlayer
-    }
-    onYouTubeIframeAPIReady?: () => void
-  }
-}
-
-type YouTubePlayer = {
-  destroy?: () => void
-  getCurrentTime?: () => number
-  getDuration?: () => number
-  getPlayerState?: () => number
-  seekTo?: (seconds: number, allowSeekAhead: boolean) => void
-}
-
-let youtubeApiPromise: Promise<Window["YT"]> | null = null
-
-function loadYouTubeApi() {
-  if (window.YT?.Player) return Promise.resolve(window.YT)
-  if (youtubeApiPromise) return youtubeApiPromise
-
-  youtubeApiPromise = new Promise((resolve) => {
-    const previousReady = window.onYouTubeIframeAPIReady
-    window.onYouTubeIframeAPIReady = () => {
-      previousReady?.()
-      resolve(window.YT)
-    }
-    const script = document.createElement("script")
-    script.src = "https://www.youtube.com/iframe_api"
-    document.body.appendChild(script)
-  })
-
-  return youtubeApiPromise
-}
-
-const providers: Provider[] = [
-  {
-    id: "deepgram",
-    name: "Deepgram",
-    models: ["nova-3", "nova-2", "whisper"],
-    canChat: false,
-    canTranscribe: true
-  },
-  {
-    id: "openrouter",
-    name: "OpenRouter",
-    models: [
-      "openai/gpt-4o-mini",
-      "anthropic/claude-3.5-sonnet",
-      "google/gemini-flash-1.5",
-      "meta-llama/llama-3.1-70b-instruct"
-    ],
-    canChat: true,
-    canTranscribe: true
-  },
-  {
-    id: "openai",
-    name: "OpenAI",
-    models: ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"],
-    canChat: true,
-    canTranscribe: true
-  },
-  {
-    id: "anthropic",
-    name: "Anthropic",
-    models: ["claude-3-5-sonnet", "claude-3-opus", "claude-3-haiku"],
-    canChat: false,
-    canTranscribe: false
-  },
-  {
-    id: "google",
-    name: "Google",
-    models: ["gemini-1.5-pro", "gemini-1.5-flash"],
-    canChat: false,
-    canTranscribe: false
-  },
-  {
-    id: "groq",
-    name: "Groq",
-    models: ["llama-3.1-70b-versatile", "mixtral-8x7b-32768"],
-    canChat: false,
-    canTranscribe: false
-  }
-]
 
 const examples = [
   "Какие главные идеи есть в видео?",
@@ -180,6 +109,22 @@ function getYouTubeId(value: string) {
   } catch {
     return null
   }
+}
+
+/** Время сообщения: «14:05» сегодня, «вчера, 14:05», иначе «25.09, 14:05». */
+function formatMessageTime(at: number, now = new Date()) {
+  const d = new Date(at)
+  const hm = d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })
+  const day = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime()
+  const diff = Math.round((day(now) - day(d)) / 86_400_000)
+  if (diff === 0) return hm
+  if (diff === 1) return `вчера, ${hm}`
+  const date = d.toLocaleDateString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    ...(d.getFullYear() !== now.getFullYear() ? { year: "numeric" } : {})
+  })
+  return `${date}, ${hm}`
 }
 
 function formatTime(seconds: number) {
@@ -216,8 +161,9 @@ function normalizeSegment(segment: Partial<TranscriptSegment> | null | undefined
   return {
     start,
     end: Number.isFinite(end) && end > start ? end : start + 0.5,
-    speaker: segment.speaker || "Спикер 1",
-    text
+    speaker: segment.speaker || "",
+    text,
+    approximate: Boolean(segment.approximate)
   }
 }
 
@@ -239,28 +185,32 @@ export default function App() {
   const [hiddenToasts, setHiddenToasts] = useState<Record<string, boolean>>(
     readLocal("scribeowl.hiddenToasts", {})
   )
-  const [providerId, setProviderId] = useState(
-    readLocal("scribeowl.providerId", "openrouter")
-  )
-  const provider = providers.find((item) => item.id === providerId) || providers[0]
-  const [model, setModel] = useState(readLocal("scribeowl.model", provider.models[0]))
-  const [apiKey, setApiKey] = useState(readLocal("scribeowl.apiKey", ""))
-  const [saved, setSaved] = useState(false)
+  const { session } = useSession()
   const iframeRef = useRef<HTMLIFrameElement>(null)
-  const youtubePlayerRef = useRef<YouTubePlayer | null>(null)
-  const [playerTime, setPlayerTime] = useState(0)
-  const [videoDuration, setVideoDuration] = useState(0)
+  const clock = usePlayerClock(iframeRef, activeId || undefined)
+  const playerTime = clock.time
+  const videoDuration = clock.duration
+  const debug = useMemo(
+    () => new URLSearchParams(window.location.search).get("debug") === "1",
+    []
+  )
+  const [transcriptProviders, setTranscriptProviders] = useState<
+    TranscriptProviderInfo[]
+  >([])
+  const [transcriptProviderChoice, setTranscriptProviderChoice] = useState<string>(
+    readLocal("scribeowl.transcriptProvider", "auto")
+  )
+  const lastUserScrollAt = useRef(0)
 
   const activeVideo = playlist.find((item) => item.id === activeId) || null
   const toastKey = activeVideo ? `${activeVideo.id}:${activeVideo.transcriptStatus}` : ""
   const showToast = Boolean(activeVideo?.transcriptStatus && !hiddenToasts[toastKey])
-  const embedUrl = activeVideo
-    ? `https://www.youtube.com/embed/${activeVideo.id}?autoplay=0&rel=0&enablejsapi=1&origin=${encodeURIComponent(window.location.origin)}`
-    : ""
+  const playerSrc = activeVideo ? embedUrl(activeVideo.id) : ""
   const lines = useMemo(() => {
     const storedSegments = activeVideo?.transcriptSegments
       ?.map(normalizeSegment)
       .filter(isTranscriptSegment)
+      .sort((a, b) => a.start - b.start)
     if (storedSegments?.length) return storedSegments
 
     const items = transcriptLines(activeVideo?.transcript || "")
@@ -268,23 +218,25 @@ export default function App() {
     return items.map((line, index) => ({
       ...speakerLine(line),
       start: index * step,
-      end: (index + 1) * step
+      end: (index + 1) * step,
+      // время из длины видео, а не от провайдера — только приблизительно
+      approximate: true
     }))
-  }, [activeVideo?.transcript, videoDuration])
-  const activeLine = lines.findIndex(
-    (line, index) =>
-      line &&
-      playerTime >= line.start &&
-      playerTime <
-        (lines.slice(index + 1).find(isTranscriptSegment)?.start ??
-          Math.max(line.end, line.start + 0.5))
-  )
+  }, [activeVideo?.transcript, activeVideo?.transcriptSegments, videoDuration])
+  const lineStarts = useMemo(() => lines.map((line) => line.start), [lines])
+  // бинарный поиск по start: активна последняя фраза, начавшаяся до текущего времени
+  const activeLine = findActiveIndex(lineStarts, playerTime)
+  const translationLang = activeVideo?.translationLang ?? null
+  const translated =
+    (translationLang && activeVideo?.translations?.[translationLang]) || null
+  const query = transcriptQuery.trim().toLowerCase()
   const filteredLines = lines
     .map((line, index) => ({ line, index }))
     .filter(
-      ({ line }) =>
+      ({ line, index }) =>
         isTranscriptSegment(line) &&
-        line.text.toLowerCase().includes(transcriptQuery.trim().toLowerCase())
+        (line.text.toLowerCase().includes(query) ||
+          Boolean(translated?.[index]?.toLowerCase().includes(query)))
     )
 
   useEffect(
@@ -298,59 +250,68 @@ export default function App() {
   useEffect(() => localStorage.setItem("scribeowl.panel", JSON.stringify(panel)), [panel])
   useEffect(() => localStorage.setItem("scribeowl.page", JSON.stringify(page)), [page])
   useEffect(
-    () => localStorage.setItem("scribeowl.providerId", JSON.stringify(providerId)),
-    [providerId]
-  )
-  useEffect(() => localStorage.setItem("scribeowl.model", JSON.stringify(model)), [model])
-  useEffect(
-    () => localStorage.setItem("scribeowl.apiKey", JSON.stringify(apiKey)),
-    [apiKey]
-  )
-  useEffect(
     () => localStorage.setItem("scribeowl.hiddenToasts", JSON.stringify(hiddenToasts)),
     [hiddenToasts]
   )
 
   useEffect(() => {
-    playlist
-      .filter((item) => item.title.startsWith("YouTube-видео:"))
-      .forEach((item) => {
-        fetchTitle(item.url).then((title) => title && patchVideo(item.id, { title }))
-      })
-  }, [playlist])
+    localStorage.setItem(
+      "scribeowl.transcriptProvider",
+      JSON.stringify(transcriptProviderChoice)
+    )
+  }, [transcriptProviderChoice])
 
+  // ключи провайдеров больше не живут в браузере — вычищаем старые значения прототипа
   useEffect(() => {
-    setPlayerTime(0)
-    setVideoDuration(0)
-    youtubePlayerRef.current?.destroy?.()
-    youtubePlayerRef.current = null
-  }, [activeId])
+    for (const key of ["scribeowl.apiKey", "scribeowl.model", "scribeowl.providerId"])
+      localStorage.removeItem(key)
+  }, [])
 
+  const reloadTranscriptProviders = useCallback(() => {
+    fetchTranscriptProviders()
+      .then(setTranscriptProviders)
+      .catch(() => setTranscriptProviders([]))
+  }, [])
+  // перезапрашиваем при входе/выходе: статус ключей пользователя
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      const player = youtubePlayerRef.current
-      if (!player?.getCurrentTime) return
-      try {
-        setPlayerTime(player.getCurrentTime())
-        const duration = player.getDuration?.()
-        if (typeof duration === "number" && Number.isFinite(duration)) {
-          setVideoDuration(duration)
-        }
-      } catch {
-        return
-      }
-    }, 250)
+    reloadTranscriptProviders()
+  }, [reloadTranscriptProviders, session?.user.id])
 
-    return () => {
-      window.clearInterval(timer)
-    }
-  }, [activeId])
-
+  // автоскролл к активной фразе, но не если пользователь сам листал последние 5 с
   useEffect(() => {
-    document
-      .querySelector('[data-active-transcript="true"]')
-      ?.scrollIntoView({ block: "nearest" })
+    if (performance.now() - lastUserScrollAt.current < 5000) return
+    scrollToActiveLine("center")
   }, [activeLine, panel])
+
+  // debug: через сколько после seek подсветка встала на нужную фразу
+  useEffect(() => {
+    if (!debug || activeLine < 0) return
+    const line = lines[activeLine]
+    const next = lines[activeLine + 1]
+    recordHighlight(
+      clock.statsRef.current,
+      performance.now(),
+      line.start,
+      next ? next.start : null
+    )
+  }, [activeLine, clock.lastSeekAt, debug, lines, clock.statsRef])
+
+  // скроллим только список фраз (не окно — иначе плеер уезжает из вида)
+  // активная фраза держится посередине панели транскрипта
+  function scrollToActiveLine(block: "center", behavior: ScrollBehavior = "smooth") {
+    const el = document.querySelector<HTMLElement>('[data-active-transcript="true"]')
+    const box = el?.closest<HTMLElement>("[data-radix-scroll-area-viewport]")
+    if (!el || !box) return
+    const e = el.getBoundingClientRect()
+    const b = box.getBoundingClientRect()
+    const top = e.top - b.top + box.scrollTop - (b.height - e.height) / 2
+    if (Math.abs(box.scrollTop - Math.max(0, top)) < 2) return
+    box.scrollTo({ top: Math.max(0, top), behavior })
+  }
+
+  const markUserScroll = useCallback(() => {
+    lastUserScrollAt.current = performance.now()
+  }, [])
 
   function patchVideo(id: string, patch: Partial<VideoItem>) {
     setPlaylist((items) =>
@@ -358,60 +319,19 @@ export default function App() {
     )
   }
 
-  function playerCommand(func: string, args: unknown[] = []) {
-    const player = youtubePlayerRef.current
-    if (func === "seekTo" && player?.seekTo) {
-      const seconds = Number(args[0])
-      if (Number.isFinite(seconds)) {
-        player.seekTo(seconds, true)
-        setPlayerTime(seconds)
-        return
-      }
-    }
-
-    iframeRef.current?.contentWindow?.postMessage(
-      JSON.stringify({ event: "command", func, args }),
-      "*"
-    )
-  }
-
-  function onPlayerLoad() {
-    const iframe = iframeRef.current
-    if (!iframe) return
-
-    loadYouTubeApi().then((YT) => {
-      if (!YT?.Player || iframeRef.current !== iframe) return
-      youtubePlayerRef.current?.destroy?.()
-      youtubePlayerRef.current = new YT.Player(iframe, {
-        events: {
-          onReady: (event) => {
-            setPlayerTime(event.target.getCurrentTime?.() || 0)
-            setVideoDuration(event.target.getDuration?.() || 0)
-          },
-          onStateChange: () => {
-            setPlayerTime(youtubePlayerRef.current?.getCurrentTime?.() || 0)
-          }
-        }
-      })
-    })
-  }
-
   function focusCurrentTranscript() {
+    lastUserScrollAt.current = 0
     setPanel("transcript")
-    window.requestAnimationFrame(() => {
-      document
-        .querySelector('[data-active-transcript="true"]')
-        ?.scrollIntoView({ block: "center" })
-    })
+    window.requestAnimationFrame(() => scrollToActiveLine("center"))
   }
 
   async function copyTranscript() {
     if (!lines.length) return
     const text = lines
-      .filter(isTranscriptSegment)
       .map(
-        (line) =>
-          `[${formatTime(line.start)} - ${formatTime(line.end)}] ${line.speaker}: ${line.text}`
+        (line, index) =>
+          `[${line.approximate ? "≈" : ""}${formatTime(line.start)} - ${formatTime(line.end)}] ${line.speaker ? `${line.speaker}: ` : ""}${line.text}` +
+          (translated?.[index] ? `\n    ${translated[index]}` : "")
       )
       .join("\n")
     try {
@@ -423,13 +343,53 @@ export default function App() {
     }
   }
 
-  async function fetchTitle(videoUrl: string) {
+  function providerName(id?: string | null) {
+    return transcriptProviders.find((item) => item.id === id)?.name || id || ""
+  }
+
+  async function loadTranscript(
+    video: Pick<VideoItem, "id" | "url" | "title">,
+    choice = transcriptProviderChoice
+  ) {
+    setBusy("transcript")
+    patchVideo(video.id, { transcriptStatus: "Загружаю транскрипт..." })
     try {
-      const response = await fetch(`/api/video?url=${encodeURIComponent(videoUrl)}`)
-      const data = await response.json()
-      return data.title || ""
-    } catch {
-      return ""
+      const data = await fetchTranscript({
+        video_id: video.id,
+        provider_id: choice === "auto" ? undefined : choice
+      })
+      // провайдер без времени фраз (EasyTranscriber): только текст — строки разложатся по длине видео (≈)
+      const approximate =
+        data.timed === false || data.segments.some((item) => item.approximate)
+      patchVideo(video.id, {
+        ...(data.title && video.title.startsWith("YouTube-видео:")
+          ? { title: data.title }
+          : {}),
+        transcript: data.segments.length
+          ? data.segments.map((item) => item.text).join("\n")
+          : data.text || "",
+        transcriptSegments: data.segments.map((item) => ({
+          start: item.start,
+          end: item.end,
+          text: item.text,
+          approximate: item.approximate
+        })),
+        transcriptProvider: data.provider_id,
+        transcriptLanguage: data.language,
+        // новые фразы → старые переводы по индексам больше не совпадают
+        translations: {},
+        transcriptStatus: `Транскрипт: ${providerName(data.provider_id)} · ${data.language} · ${data.segments.length} фраз${approximate ? " · ≈ время фраз приблизительное" : ""}`
+      })
+    } catch (error) {
+      const e = error instanceof ApiError ? error : null
+      const who = e?.providerId ? ` (${providerName(e.providerId)})` : ""
+      patchVideo(video.id, {
+        transcriptStatus: `Транскрипт не получен${who}: ${
+          error instanceof Error ? error.message : "ошибка"
+        }${e?.code ? ` [${e.code}]` : ""}`
+      })
+    } finally {
+      setBusy("")
     }
   }
 
@@ -437,140 +397,246 @@ export default function App() {
     event.preventDefault()
     const id = getYouTubeId(url)
     if (!id) return
-    const title = await fetchTitle(url)
     const next: VideoItem = {
       id,
       url,
-      title: title || `YouTube-видео: ${id}`,
+      title: `YouTube-видео: ${id}`,
       transcript: "",
       transcriptSegments: [],
       summary: "",
-      transcriptStatus: "Видео добавлено. Запустите AI-транскрипцию.",
+      transcriptStatus: "Загружаю транскрипт...",
       messages: []
     }
     setPlaylist((items) => [next, ...items.filter((item) => item.id !== id)])
     setActiveId(id)
     setPanel("transcript")
     setUrl("")
+    await loadTranscript(next)
   }
 
-  async function generateTranscript(video = activeVideo) {
-    if (!video || busy) return
-    setActiveId(video.id)
-    setPanel("transcript")
-    if (!provider.canTranscribe) {
-      patchVideo(video.id, {
-        transcriptStatus: "AI-транскрипция доступна через Deepgram, OpenRouter и OpenAI."
+  // ---------- перевод транскрипта ----------
+  const [translateJob, setTranslateJob] = useState<{
+    videoId: string
+    lang: string
+    done: number
+    total: number
+    running: boolean
+    error?: string
+    /** остановлен пользователем (а не закончился) */
+    stopped?: boolean
+  } | null>(null)
+  const translateAbort = useRef<AbortController | null>(null)
+
+  function mergeTranslation(
+    videoId: string,
+    lang: string,
+    total: number,
+    items: { i: number; text: string }[]
+  ) {
+    setPlaylist((all) =>
+      all.map((v) => {
+        if (v.id !== videoId) return v
+        const prev = v.translations?.[lang] ?? []
+        const next = Array.from({ length: total }, (_, k) => prev[k] ?? null)
+        for (const it of items) if (it.i < total) next[it.i] = it.text
+        return { ...v, translations: { ...(v.translations ?? {}), [lang]: next } }
+      })
+    )
+  }
+
+  async function runTranslation(video: VideoItem, code: string) {
+    translateAbort.current?.abort()
+    const lang = languageByCode(code)
+    if (!lang) return
+    const texts = lines.map((l) => l.text)
+    const total = texts.length
+    const existing = video.translations?.[code] ?? []
+    const batches = planBatches(texts, existing, activeLine >= 0 ? activeLine : 0)
+    let done = texts.filter((_, i) => existing[i]).length
+    if (!session) {
+      setTranslateJob({
+        videoId: video.id,
+        lang: code,
+        done,
+        total,
+        running: false,
+        error: "Войдите в профиле, чтобы переводить."
       })
       return
     }
-    if (!apiKey.trim()) {
-      patchVideo(video.id, {
-        transcriptStatus: `Добавьте API-ключ ${provider.name} в профиле.`
-      })
+    if (!batches.length) {
+      setTranslateJob({ videoId: video.id, lang: code, done, total, running: false })
       return
     }
-    setBusy("transcript")
-    patchVideo(video.id, {
-      transcriptStatus: `AI распознаёт аудио через ${provider.name}...`
-    })
+    const ctrl = new AbortController()
+    translateAbort.current = ctrl
+    setTranslateJob({ videoId: video.id, lang: code, done, total, running: true })
+    const local = Array.from({ length: total }, (_, k) => existing[k] ?? null)
+    const queue = [...batches]
+    const worker = async () => {
+      while (queue.length && !ctrl.signal.aborted) {
+        const batch = queue.shift()!
+        const res = await translateBatch(
+          { target_language: lang.prompt, title: video.title, segments: batch },
+          ctrl.signal
+        )
+        if (ctrl.signal.aborted) return
+        mergeTranslation(video.id, code, total, res.items)
+        for (const it of res.items) if (it.i < total) local[it.i] = it.text
+        done += res.items.length
+        setTranslateJob((j) =>
+          j && j.videoId === video.id && j.lang === code ? { ...j, done } : j
+        )
+      }
+    }
     try {
-      const response = await fetch("/api/transcribe", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ providerId, model, apiKey, id: video.id, url: video.url })
-      })
-      const data = await response.json()
-      patchVideo(video.id, {
-        transcript: data.transcript || "",
-        transcriptSegments: data.segments || [],
-        transcriptStatus:
-          data.transcript || data.segments?.length
-            ? "AI-транскрипт готов."
-            : data.error || "AI-транскрипция не выполнена."
-      })
+      await Promise.all([worker(), worker()]) // 2 пачки параллельно — быстрее, но без лишней нагрузки на лимиты
+      // модель иногда пропускает строку — один повторный проход только по пропущенным
+      if (!ctrl.signal.aborted) {
+        queue.push(...planBatches(texts, local, 0))
+        if (queue.length) await Promise.all([worker(), worker()])
+      }
+      if (!ctrl.signal.aborted)
+        setTranslateJob((j) =>
+          j && j.videoId === video.id ? { ...j, running: false } : j
+        )
     } catch (error) {
-      patchVideo(video.id, {
-        transcriptStatus:
-          error instanceof Error ? error.message : "AI-транскрипция не выполнена."
-      })
-    } finally {
-      setBusy("")
+      if (ctrl.signal.aborted) return
+      ctrl.abort()
+      setTranslateJob((j) =>
+        j && j.videoId === video.id
+          ? { ...j, running: false, error: aiErrorText(error) }
+          : j
+      )
     }
   }
 
-  async function askAi(question: string) {
-    if (!activeVideo) return "Сначала добавьте видео."
-    if (!provider.canChat)
-      return "Для саммари и чата сейчас выберите OpenRouter или OpenAI в профиле."
-    if (!apiKey.trim()) return `Добавьте API-ключ ${provider.name} в профиле.`
-    if (!activeVideo.transcript.trim()) return "Сначала сгенерируйте AI-транскрипт."
+  function stopTranslation() {
+    translateAbort.current?.abort()
+    setTranslateJob((j) => (j ? { ...j, running: false, stopped: true } : j))
+  }
 
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        providerId,
-        model,
-        apiKey,
-        title: activeVideo.title,
-        transcript: activeVideo.transcript.slice(0, 20000),
-        question
-      })
-    })
-    const data = await response.json()
-    return data.answer || data.error || "AI-запрос не выполнен"
+  function chooseTranslation(code: string | null) {
+    if (!activeVideo) return
+    patchVideo(activeVideo.id, { translationLang: code })
+    if (!code) {
+      stopTranslation()
+      setTranslateJob(null)
+      return
+    }
+    runTranslation({ ...activeVideo, translationLang: code }, code)
+  }
+
+  // смена видео — останавливаем перевод предыдущего
+  useEffect(() => {
+    translateAbort.current?.abort()
+    setTranslateJob(null)
+  }, [activeId])
+
+  // клик по таймкоду в ответе AI → перемотка + подсветка фразы в транскрипте
+  const seekFromAnswer = useCallback(
+    (seconds: number) => {
+      lastUserScrollAt.current = 0
+      clock.seekTo(seconds)
+    },
+    [clock.seekTo]
+  )
+
+  function aiPrecondition(): string | null {
+    if (!session) return "Войдите в профиле, чтобы пользоваться AI."
+    if (!activeVideo) return "Сначала добавьте видео."
+    if (!activeVideo.transcript.trim()) return "Сначала загрузите транскрипт."
+    return null
+  }
+
+  function aiErrorText(error: unknown) {
+    if (error instanceof ApiError && error.code === "not_configured")
+      return `${error.message}. Откройте «Профиль».`
+    return error instanceof Error ? error.message : "AI-запрос не выполнен"
   }
 
   async function ask(event: FormEvent) {
     event.preventDefault()
     const text = prompt.trim()
     if (!activeVideo || !text || busy) return
-    patchVideo(activeVideo.id, {
-      messages: [...activeVideo.messages, { role: "user", text }]
-    })
+    const video = activeVideo
+    const history: Message[] = [...video.messages, { role: "user", text, at: Date.now() }]
     setPrompt("")
+    const blocked = aiPrecondition()
+    if (blocked) {
+      patchVideo(video.id, {
+        messages: [...history, { role: "assistant", text: blocked, at: Date.now() }]
+      })
+      return
+    }
     setBusy("chat")
-    const answer = await askAi(text)
-    patchVideo(activeVideo.id, {
-      messages: [
-        ...activeVideo.messages,
-        { role: "user", text },
-        { role: "assistant", text: answer }
-      ]
-    })
-    setBusy("")
+    let answer = ""
+    const answeredAt = Date.now()
+    const render = (value: string) =>
+      patchVideo(video.id, {
+        messages: [...history, { role: "assistant", text: value, at: answeredAt }]
+      })
+    render("…")
+    try {
+      await streamAi(
+        {
+          task: "chat",
+          title: video.title,
+          transcript: buildTimedTranscript(video.transcriptSegments, video.transcript),
+          messages: history.slice(-20).map((m) => ({ role: m.role, content: m.text }))
+        },
+        (delta) => {
+          answer += delta
+          render(answer)
+        }
+      )
+      if (!answer) render("Пустой ответ модели.")
+    } catch (error) {
+      render(answer ? `${answer}\n\n[обрыв: ${aiErrorText(error)}]` : aiErrorText(error))
+    } finally {
+      setBusy("")
+    }
   }
 
   async function generateSummary() {
     if (!activeVideo || busy) return
+    const video = activeVideo
+    const blocked = aiPrecondition()
+    if (blocked) {
+      patchVideo(video.id, { summary: blocked })
+      return
+    }
     setBusy("summary")
-    const answer = await askAi(
-      "Сделай короткое структурированное саммари видео на русском: главная идея, 5 ключевых тезисов, практический вывод."
-    )
-    patchVideo(activeVideo.id, { summary: answer })
-    setBusy("")
-  }
-
-  function changeProvider(nextProviderId: string) {
-    const nextProvider =
-      providers.find((item) => item.id === nextProviderId) || providers[0]
-    setProviderId(nextProvider.id)
-    setModel(nextProvider.models[0])
-  }
-
-  function saveProfile() {
-    localStorage.setItem("scribeowl.providerId", JSON.stringify(providerId))
-    localStorage.setItem("scribeowl.model", JSON.stringify(model))
-    localStorage.setItem("scribeowl.apiKey", JSON.stringify(apiKey))
-    setSaved(true)
-    window.setTimeout(() => setSaved(false), 1600)
+    let summary = ""
+    patchVideo(video.id, { summary: "…" })
+    try {
+      await streamAi(
+        {
+          task: "summary",
+          title: video.title,
+          transcript: buildTimedTranscript(video.transcriptSegments, video.transcript)
+        },
+        (delta) => {
+          summary += delta
+          patchVideo(video.id, { summary })
+        }
+      )
+    } catch (error) {
+      patchVideo(video.id, {
+        summary: summary
+          ? `${summary}\n\n[обрыв: ${aiErrorText(error)}]`
+          : aiErrorText(error)
+      })
+    } finally {
+      setBusy("")
+    }
   }
 
   return (
-    <main className="min-h-screen overflow-x-hidden bg-background text-foreground">
-      <section className="container py-10">
-        <header className="mb-6 flex flex-col gap-4 px-5 py-4 md:flex-row md:items-center md:justify-between">
+    // lg+: приложение ровно в высоту окна, страница не скроллится — скроллятся плейлист и панель справа
+    <main className="flex min-h-screen flex-col overflow-x-hidden bg-background text-foreground lg:h-screen lg:overflow-hidden">
+      <section className="container flex min-h-0 flex-1 flex-col py-3">
+        <header className="mb-3 flex shrink-0 items-center justify-between gap-4 px-1">
           <button
             type="button"
             className="font-semibold"
@@ -583,42 +649,40 @@ export default function App() {
             className="gap-2"
             onClick={() => setPage("profile")}>
             <PersonIcon />
-            Профиль
+            {session?.user.email ?? "Войти"}
           </Button>
         </header>
 
         {page === "profile" ? (
-          <ProfilePage
-            apiKey={apiKey}
-            model={model}
-            provider={provider}
-            providerId={providerId}
-            saved={saved}
-            onApiKey={setApiKey}
-            onModel={setModel}
-            onProvider={changeProvider}
-            onSave={saveProfile}
-            onBack={() => setPage("player")}
-          />
+          <div className="min-h-0 flex-1 lg:overflow-auto">
+            <ProfilePage
+              session={session}
+              onBack={() => setPage("player")}
+              transcriptProviders={transcriptProviders}
+              transcriptChoice={transcriptProviderChoice}
+              onTranscriptChoice={setTranscriptProviderChoice}
+              onTranscriptProvidersChanged={reloadTranscriptProviders}
+            />
+          </div>
         ) : (
-          <Card>
-            <CardContent className="grid gap-4 p-6 lg:grid-cols-[minmax(0,1fr)_minmax(360px,460px)]">
-              <section className="min-w-0 overflow-hidden">
-                <div className="overflow-hidden rounded-md border bg-muted">
+          <Card className="lg:min-h-0 lg:flex-1">
+            <CardContent className="grid gap-4 p-4 lg:h-full lg:grid-cols-[minmax(0,1fr)_minmax(360px,460px)] lg:grid-rows-[minmax(0,1fr)]">
+              <section className="flex min-w-0 flex-col overflow-hidden lg:min-h-0">
+                <div className="shrink-0 overflow-hidden rounded-md border bg-muted">
                   {activeVideo ? (
                     <iframe
                       key={activeVideo.id}
                       id={`youtube-player-${activeVideo.id}`}
                       ref={iframeRef}
                       title={activeVideo.title}
-                      src={embedUrl}
-                      onLoad={onPlayerLoad}
-                      className="aspect-video h-full min-h-[360px] w-full"
+                      src={playerSrc}
+                      onLoad={clock.onIframeLoad}
+                      className="aspect-video max-h-[55vh] min-h-[200px] lg:max-h-[min(55vh,calc(100vh_-_420px))] w-full"
                       allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                       allowFullScreen
                     />
                   ) : (
-                    <div className="flex aspect-video min-h-[360px] items-center justify-center px-8 text-center text-muted-foreground">
+                    <div className="flex aspect-video max-h-[55vh] min-h-[200px] lg:max-h-[min(55vh,calc(100vh_-_420px))] w-full items-center justify-center px-8 text-center text-muted-foreground">
                       <div>
                         <p className="text-xl font-semibold text-foreground">
                           Добавьте первое YouTube-видео
@@ -631,13 +695,17 @@ export default function App() {
                   )}
                 </div>
 
-                <div className="mt-5">
-                  <h1 className="text-lg font-bold leading-snug">
+                {debug && activeVideo ? (
+                  <DebugPanel clockRef={clock.clockRef} statsRef={clock.statsRef} />
+                ) : null}
+
+                <div className="mt-3 shrink-0">
+                  <h1 className="line-clamp-2 text-lg font-bold leading-snug">
                     {activeVideo?.title || "Плеер пуст"}
                   </h1>
                 </div>
 
-                <form onSubmit={loadUrl} className="mt-5 flex gap-2">
+                <form onSubmit={loadUrl} className="mt-3 flex shrink-0 gap-2">
                   <Input
                     value={url}
                     onChange={(event) => setUrl(event.target.value)}
@@ -647,72 +715,85 @@ export default function App() {
                   <Button className="h-11">Загрузить видео</Button>
                 </form>
 
-                {playlist.length > 0 && (
-                  <section className="mt-5 w-full overflow-hidden rounded-lg border bg-muted p-4">
-                    <h2 className="mb-3 text-sm font-semibold">Плейлист</h2>
-                    <div className="grid gap-2">
-                      {playlist.map((item) => (
-                        <div
-                          key={item.id}
-                          className={cn(
-                            "relative grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-md border bg-card p-3 text-sm",
-                            item.id === activeId
-                              ? "border-primary ring-1 ring-primary"
-                              : "border-border"
-                          )}>
-                          <button
-                            type="button"
-                            className="min-w-0 text-left"
-                            onClick={() => setActiveId(item.id)}>
-                            <span className="flex min-w-0 items-center gap-3">
-                              <span className="min-w-0 flex-1 truncate font-medium">
-                                {item.title}
-                              </span>
-                              {item.transcript ? (
-                                <span className="shrink-0 rounded-md bg-secondary px-2 py-1 text-xs font-medium text-secondary-foreground">
-                                  Транскрибировано
-                                </span>
-                              ) : null}
+                {/* плейлист: вся оставшаяся высота, скролл внутри */}
+                <section className="mt-3 flex min-h-[200px] w-full flex-1 flex-col overflow-hidden rounded-lg border bg-muted p-4 lg:min-h-0">
+                  <h2 className="mb-3 shrink-0 text-sm font-semibold">
+                    Плейлист
+                    {playlist.length ? (
+                      <span className="ml-2 font-normal text-muted-foreground">
+                        {playlist.length}
+                      </span>
+                    ) : null}
+                  </h2>
+                  {playlist.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">
+                      Пусто — вставьте ссылку на YouTube выше.
+                    </p>
+                  ) : null}
+                  <div className="-mx-1 grid min-h-0 flex-1 content-start gap-2 overflow-y-auto px-1 pb-1">
+                    {playlist.map((item) => (
+                      <div
+                        key={item.id}
+                        className={cn(
+                          "relative grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-md border bg-card p-3 text-sm",
+                          item.id === activeId
+                            ? "border-primary ring-1 ring-primary"
+                            : "border-border"
+                        )}>
+                        <button
+                          type="button"
+                          className="min-w-0 text-left"
+                          onClick={() => setActiveId(item.id)}>
+                          <span className="flex min-w-0 items-center gap-3">
+                            <span className="min-w-0 flex-1 truncate font-medium">
+                              {item.title}
                             </span>
-                            {!item.transcript ? (
-                              <span className="mt-1 block truncate text-xs text-muted-foreground">
-                                {item.transcriptStatus}
+                            {item.transcript ? (
+                              <span className="shrink-0 rounded-md bg-secondary px-2 py-1 text-xs font-medium text-secondary-foreground">
+                                Транскрибировано
                               </span>
                             ) : null}
-                          </button>
-                          <button
-                            type="button"
-                            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md hover:bg-muted"
-                            onClick={(event) => {
-                              event.stopPropagation()
-                              setOpenMenuId(openMenuId === item.id ? "" : item.id)
-                            }}>
-                            <DotsHorizontalIcon />
-                          </button>
-                          {openMenuId === item.id ? (
-                            <div className="absolute right-3 top-12 z-20 w-[min(16rem,calc(100%-1.5rem))] rounded-md border bg-popover p-1 text-popover-foreground shadow-md">
-                              <button
-                                type="button"
-                                className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
-                                disabled={Boolean(busy)}
-                                onClick={() => {
-                                  setOpenMenuId("")
-                                  generateTranscript(item)
-                                }}>
-                                {item.transcript
-                                  ? "Перегенерировать AI-транскрипт"
-                                  : "Сгенерировать AI-транскрипт"}
-                              </button>
-                            </div>
+                          </span>
+                          {!item.transcript ? (
+                            <span className="mt-1 block truncate text-xs text-muted-foreground">
+                              {item.transcriptStatus}
+                            </span>
                           ) : null}
-                        </div>
-                      ))}
-                    </div>
-                  </section>
-                )}
+                        </button>
+                        <button
+                          type="button"
+                          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md hover:bg-muted"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            setOpenMenuId(openMenuId === item.id ? "" : item.id)
+                          }}>
+                          <DotsHorizontalIcon />
+                        </button>
+                        {openMenuId === item.id ? (
+                          <div className="absolute right-3 top-12 z-20 w-[min(16rem,calc(100%-1.5rem))] rounded-md border bg-popover p-1 text-popover-foreground shadow-md">
+                            <button
+                              type="button"
+                              className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
+                              disabled={Boolean(busy)}
+                              onClick={() => {
+                                setOpenMenuId("")
+                                setActiveId(item.id)
+                                setPanel("transcript")
+                                loadTranscript(item)
+                              }}>
+                              {item.transcript
+                                ? "Обновить транскрипт"
+                                : "Загрузить транскрипт"}
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                </section>
               </section>
 
-              <aside className="min-w-0 overflow-hidden rounded-lg border bg-card lg:h-[calc(100vh-10rem)] lg:min-h-[520px] lg:max-h-[760px]">
+              <aside className="h-[75vh] min-w-0 overflow-hidden rounded-lg border bg-card lg:h-full lg:min-h-0">
                 <Tabs
                   value={panel}
                   onValueChange={(value) => setPanel(value as Panel)}
@@ -740,8 +821,30 @@ export default function App() {
                       panel === "chat" ? "grid-rows-[1fr_auto]" : "grid-rows-1"
                     )}>
                     <ScrollArea
+                      onWheel={markUserScroll}
+                      onTouchMove={markUserScroll}
+                      onPointerDown={(event) => {
+                        // перетаскивание скроллбара (у кнопок фраз нет data-orientation)
+                        if ((event.target as HTMLElement).closest("[data-orientation]"))
+                          markUserScroll()
+                      }}
+                      onKeyDown={(event) => {
+                        if (
+                          [
+                            "ArrowUp",
+                            "ArrowDown",
+                            "PageUp",
+                            "PageDown",
+                            "Home",
+                            "End",
+                            " "
+                          ].includes(event.key)
+                        )
+                          markUserScroll()
+                      }}
                       className={cn(
-                        "min-h-0 px-3 py-3",
+                        // Radix оборачивает контент в display:table — он растягивается по самой длинной строке
+                        "min-h-0 px-3 py-3 [&_[data-radix-scroll-area-viewport]>div]:!block",
                         panel === "transcript" && "h-full"
                       )}>
                       {!activeVideo && <EmptyState />}
@@ -752,7 +855,7 @@ export default function App() {
                           <div className="mx-auto flex max-w-[360px] flex-col items-center pt-7 text-center">
                             <h2 className="text-2xl font-medium">YouTube AI</h2>
                             <p className="mt-8 leading-7 text-muted-foreground">
-                              Задавайте вопросы только после AI-транскрипции видео.
+                              Вопросы по видео — после загрузки транскрипта.
                             </p>
                             <p className="mt-8 text-muted-foreground">
                               Попробуйте пример:
@@ -776,17 +879,39 @@ export default function App() {
                       {activeVideo &&
                         panel === "chat" &&
                         activeVideo.messages.length > 0 && (
-                          <div className="grid gap-3">
+                          <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3">
                             {activeVideo.messages.map((message, index) => (
                               <div
                                 key={index}
                                 className={cn(
-                                  "max-w-[85%] rounded-md border p-3 text-sm leading-6",
+                                  // длинные URL/идентификаторы переносим, переводы строк сохраняем
+                                  "w-fit min-w-0 max-w-[85%] rounded-md border p-3 text-sm leading-6 [overflow-wrap:anywhere]",
                                   message.role === "user"
-                                    ? "ml-auto bg-primary text-primary-foreground"
+                                    ? "ml-auto whitespace-pre-wrap bg-primary text-primary-foreground"
                                     : "bg-muted"
                                 )}>
-                                {message.text}
+                                {message.role === "assistant" ? (
+                                  <Markdown
+                                    onSeek={seekFromAnswer}
+                                    duration={videoDuration || undefined}>
+                                    {message.text}
+                                  </Markdown>
+                                ) : (
+                                  message.text
+                                )}
+                                {message.at ? (
+                                  <time
+                                    dateTime={new Date(message.at).toISOString()}
+                                    title={new Date(message.at).toLocaleString("ru-RU")}
+                                    className={cn(
+                                      "mt-1 block text-right text-[11px] leading-4",
+                                      message.role === "user"
+                                        ? "text-primary-foreground/70"
+                                        : "text-muted-foreground"
+                                    )}>
+                                    {formatMessageTime(message.at)}
+                                  </time>
+                                ) : null}
                               </div>
                             ))}
                           </div>
@@ -799,11 +924,15 @@ export default function App() {
                             <p className="mt-2 text-muted-foreground">
                               {activeVideo.transcript
                                 ? "Готово к генерации саммари."
-                                : "Сначала сгенерируйте AI-транскрипт."}
+                                : "Сначала загрузите транскрипт."}
                             </p>
                           </div>
                           {activeVideo.summary ? (
-                            <p className="whitespace-pre-wrap">{activeVideo.summary}</p>
+                            <Markdown
+                              onSeek={seekFromAnswer}
+                              duration={videoDuration || undefined}>
+                              {activeVideo.summary}
+                            </Markdown>
                           ) : null}
                           <Button
                             type="button"
@@ -821,7 +950,49 @@ export default function App() {
 
                       {activeVideo && panel === "transcript" && (
                         <div className="grid gap-3">
-                          <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-2">
+                          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                            <Select
+                              value={transcriptProviderChoice}
+                              onValueChange={setTranscriptProviderChoice}>
+                              <SelectTrigger aria-label="Провайдер транскрипта">
+                                <SelectValue placeholder="Провайдер" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="auto">
+                                  Авто (по порядку с фолбэком)
+                                </SelectItem>
+                                {transcriptProviders.map((item) => (
+                                  <SelectItem
+                                    key={item.id}
+                                    value={item.id}
+                                    disabled={!item.configured}>
+                                    {item.name}
+                                    {item.configured ? "" : " — нет ключа на сервере"}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              disabled={busy === "transcript"}
+                              onClick={() => loadTranscript(activeVideo)}>
+                              {busy === "transcript"
+                                ? "Загружаю..."
+                                : activeVideo.transcript
+                                  ? "Обновить"
+                                  : "Загрузить"}
+                            </Button>
+                          </div>
+                          {activeVideo.transcriptProvider ? (
+                            <p className="text-xs text-muted-foreground">
+                              Источник: {providerName(activeVideo.transcriptProvider)}
+                              {activeVideo.transcriptLanguage
+                                ? ` · ${activeVideo.transcriptLanguage}`
+                                : ""}
+                            </p>
+                          ) : null}
+                          <div className="grid grid-cols-[minmax(0,1fr)_auto_auto_auto] gap-2">
                             <div className="relative">
                               <MagnifyingGlassIcon className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                               <Input
@@ -837,7 +1008,7 @@ export default function App() {
                               type="button"
                               variant="outline"
                               size="icon"
-                              title="Фокус на текущий момент"
+                              title="К текущей фразе"
                               onClick={focusCurrentTranscript}>
                               <Crosshair2Icon />
                             </Button>
@@ -853,7 +1024,72 @@ export default function App() {
                               onClick={copyTranscript}>
                               {copiedTranscript ? <CheckIcon /> : <ClipboardCopyIcon />}
                             </Button>
+                            <TranslatePicker
+                              value={translationLang}
+                              busy={Boolean(translateJob?.running)}
+                              onConfirm={chooseTranslation}
+                            />
                           </div>
+                          {translationLang &&
+                          translateJob &&
+                          translateJob.videoId === activeVideo.id ? (
+                            <div
+                              className={cn(
+                                "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs",
+                                translateJob.error
+                                  ? "border-destructive text-destructive"
+                                  : "text-muted-foreground"
+                              )}>
+                              {translateJob.error ? (
+                                <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+                                  Перевод остановлен: {translateJob.error}
+                                </span>
+                              ) : (
+                                <span className="flex-1">
+                                  Перевод на{" "}
+                                  {languageByCode(translateJob.lang)?.label.toLowerCase()}
+                                  : {Math.min(translateJob.done, translateJob.total)} из{" "}
+                                  {translateJob.total}
+                                  {translateJob.running
+                                    ? "…"
+                                    : translateJob.done >= translateJob.total
+                                      ? " — готово"
+                                      : translateJob.stopped
+                                        ? " — остановлен"
+                                        : ` — готово, без перевода: ${translateJob.total - translateJob.done}`}
+                                </span>
+                              )}
+                              {translateJob.running ? (
+                                <button
+                                  type="button"
+                                  className="underline underline-offset-2"
+                                  onClick={stopTranslation}>
+                                  Остановить
+                                </button>
+                              ) : translateJob.done < translateJob.total ? (
+                                <button
+                                  type="button"
+                                  className="underline underline-offset-2"
+                                  onClick={() =>
+                                    runTranslation(activeVideo, translateJob.lang)
+                                  }>
+                                  {translateJob.error
+                                    ? "Повторить"
+                                    : translateJob.stopped
+                                      ? "Продолжить"
+                                      : "Допереводить"}
+                                </button>
+                              ) : null}
+                              <div className="h-1 w-full overflow-hidden rounded bg-muted">
+                                <div
+                                  className="h-full bg-primary transition-all"
+                                  style={{
+                                    width: `${(100 * translateJob.done) / Math.max(1, translateJob.total)}%`
+                                  }}
+                                />
+                              </div>
+                            </div>
+                          ) : null}
                           {showToast ? (
                             <div className="flex items-center gap-3 rounded-md border bg-muted p-4 text-sm leading-6 text-muted-foreground">
                               <span>{activeVideo.transcriptStatus}</span>
@@ -878,25 +1114,39 @@ export default function App() {
                                 data-active-transcript={
                                   index === activeLine ? "true" : undefined
                                 }
-                                onClick={() =>
-                                  playerCommand("seekTo", [line.start, true])
-                                }
+                                onClick={() => clock.seekTo(line.start)}
                                 className={cn(
-                                  "grid gap-3 rounded-md border p-3 text-left transition-colors",
+                                  "grid gap-1 rounded-md border px-3 py-2 text-left transition-colors",
                                   index === activeLine
                                     ? "border-primary bg-accent"
-                                    : "border-border bg-card"
+                                    : "border-border bg-card hover:bg-accent/50"
                                 )}>
-                                <span className="flex flex-wrap items-center gap-1.5">
-                                  <span className="inline-flex h-8 items-center gap-1.5 rounded-md border bg-background px-2.5 text-xs font-medium text-primary">
-                                    <ClockIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                                    {formatTime(line.start)} · {formatTime(line.end)}
-                                  </span>
-                                  <span className="inline-flex h-8 items-center rounded-md border bg-background px-2.5 text-xs font-medium">
-                                    {line.speaker}
-                                  </span>
+                                {/* таймкод — второстепенный: мелко, бледно, без рамки */}
+                                <span className="text-[11px] leading-4 text-muted-foreground/80">
+                                  {line.approximate ? (
+                                    <span title="Время фразы приблизительное">≈ </span>
+                                  ) : null}
+                                  {formatTime(line.start)} – {formatTime(line.end)}
+                                  {line.speaker ? ` · ${line.speaker}` : ""}
                                 </span>
-                                <span className="text-sm leading-6">{line.text}</span>
+                                {translationLang ? (
+                                  <span className="grid grid-cols-2 gap-3">
+                                    <span className="min-w-0 text-sm leading-6 [overflow-wrap:anywhere]">
+                                      {line.text}
+                                    </span>
+                                    <span
+                                      className={cn(
+                                        "min-w-0 border-l pl-3 text-sm leading-6 [overflow-wrap:anywhere]",
+                                        translated?.[index]
+                                          ? "text-foreground/80"
+                                          : "text-muted-foreground/60"
+                                      )}>
+                                      {translated?.[index] ?? "…"}
+                                    </span>
+                                  </span>
+                                ) : (
+                                  <span className="text-sm leading-6">{line.text}</span>
+                                )}
                               </button>
                             ))}
                           </div>
@@ -943,145 +1193,5 @@ function EmptyState() {
         Добавьте ссылку под плеером, чтобы создать плейлист и запустить AI-функции.
       </p>
     </div>
-  )
-}
-
-function ProfilePage({
-  apiKey,
-  model,
-  provider,
-  providerId,
-  saved,
-  onApiKey,
-  onModel,
-  onProvider,
-  onSave,
-  onBack
-}: {
-  apiKey: string
-  model: string
-  provider: Provider
-  providerId: string
-  saved: boolean
-  onApiKey: (value: string) => void
-  onModel: (value: string) => void
-  onProvider: (value: string) => void
-  onSave: () => void
-  onBack: () => void
-}) {
-  return (
-    <Card>
-      <CardContent className="grid gap-6 p-6 lg:grid-cols-[320px_minmax(0,1fr)]">
-        <aside className="rounded-md bg-muted p-5">
-          <div className="flex h-14 w-14 items-center justify-center rounded-full bg-primary text-primary-foreground">
-            <PersonIcon className="h-6 w-6" />
-          </div>
-          <h1 className="mt-5 text-2xl font-semibold">Профиль</h1>
-          <p className="mt-3 text-sm leading-6 text-muted-foreground">
-            Ключ хранится в localStorage этого браузера.
-          </p>
-          <div className="mt-6 rounded-md border bg-card p-4 text-sm">
-            <p className="font-medium">Текущая настройка</p>
-            <p className="mt-2 text-muted-foreground">{provider.name}</p>
-            <p className="text-muted-foreground">{model}</p>
-            <p
-              className={cn(
-                "mt-3 font-medium",
-                apiKey ? "text-primary" : "text-muted-foreground"
-              )}>
-              {apiKey ? "API-ключ добавлен" : "API-ключ не добавлен"}
-            </p>
-          </div>
-        </aside>
-
-        <div className="grid gap-5">
-          <Card>
-            <CardHeader>
-              <CardTitle>AI-провайдер</CardTitle>
-              <CardDescription>
-                Deepgram работает для точного транскрипта с таймкодами и спикерами.
-                OpenRouter и OpenAI работают для саммари и чата.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="mt-5 grid gap-3 md:grid-cols-2">
-                {providers.map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => onProvider(item.id)}
-                    className={cn(
-                      "rounded-md border p-4 text-left transition-colors",
-                      item.id === providerId
-                        ? "border-primary bg-primary text-primary-foreground"
-                        : "border-border bg-card hover:bg-accent hover:text-accent-foreground"
-                    )}>
-                    <span className="font-semibold">{item.name}</span>
-                    <span
-                      className={cn(
-                        "mt-2 block text-sm",
-                        item.id === providerId
-                          ? "text-primary-foreground/80"
-                          : "text-muted-foreground"
-                      )}>
-                      {item.canTranscribe && item.canChat
-                        ? "транскрипт, саммари, чат"
-                        : item.canTranscribe
-                          ? "точный транскрипт"
-                          : item.canChat
-                            ? "саммари и чат"
-                            : "пока не подключен"}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Доступ к модели</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="grid gap-2">
-                  <Label>Модель</Label>
-                  <Select value={model} onValueChange={onModel}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {provider.models.map((item) => (
-                        <SelectItem key={item} value={item}>
-                          {item}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="grid gap-2">
-                  <Label>API-ключ</Label>
-                  <Input
-                    type="password"
-                    value={apiKey}
-                    onChange={(event) => onApiKey(event.target.value)}
-                    placeholder={`API-ключ ${provider.name}`}
-                  />
-                </div>
-              </div>
-              <div className="mt-5 flex flex-wrap gap-3">
-                <Button type="button" className="gap-2" onClick={onSave}>
-                  {saved ? <CheckIcon /> : null}
-                  {saved ? "Сохранено" : "Сохранить профиль"}
-                </Button>
-                <Button type="button" variant="outline" onClick={onBack}>
-                  Вернуться к плееру
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </CardContent>
-    </Card>
   )
 }

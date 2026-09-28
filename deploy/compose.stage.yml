@@ -1,3 +1,4 @@
+# Stage-фронт ScribeowlAI: статика (настройки вшиты при сборке из GitHub Secrets). Маршрут Traefik — как раньше.
 services:
   scribeowl:
     image: scribeowl:stage

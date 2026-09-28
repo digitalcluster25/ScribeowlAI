@@ -16,13 +16,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build application image
-        run: docker build -t scribeowl:stage .
+      - name: Run frontend tests
+        run: docker build --target test .
+      # Те же переменные, что локально в .env.local; значения для stage — в GitHub Secrets (STAGE_*)
+      - name: Build frontend image
+        env:
+          VITE_API_URL: ${{ secrets.STAGE_VITE_API_URL }}
+          VITE_SUPABASE_URL: ${{ secrets.STAGE_VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.STAGE_VITE_SUPABASE_PUBLISHABLE_KEY }}
+        run: |
+          docker build -t scribeowl:stage \
+            --build-arg VITE_API_URL \
+            --build-arg VITE_SUPABASE_URL \
+            --build-arg VITE_SUPABASE_PUBLISHABLE_KEY .
       - name: Package image
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/stage' && github.event_name != 'pull_request'
         run: docker save scribeowl:stage | gzip -1 > scribeowl-stage.tar.gz
       - name: Configure SSH
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/stage' && github.event_name != 'pull_request'
         env:
           DEPLOY_KEY: ${{ secrets.STAGE_DEPLOY_SSH_KEY }}
           KNOWN_HOSTS: ${{ secrets.STAGE_DEPLOY_KNOWN_HOSTS }}
@@ -32,11 +43,11 @@ jobs:
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
       - name: Deploy to stage server
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/stage' && github.event_name != 'pull_request'
         run: |
           ssh root@69.62.121.157 'install -d -m 755 /opt/scribeowl'
           scp scribeowl-stage.tar.gz deploy/compose.stage.yml root@69.62.121.157:/opt/scribeowl/
-          ssh root@69.62.121.157 'docker load -i /opt/scribeowl/scribeowl-stage.tar.gz && docker compose -f /opt/scribeowl/compose.stage.yml up -d --force-recreate && rm /opt/scribeowl/scribeowl-stage.tar.gz'
+          ssh root@69.62.121.157 'cd /opt/scribeowl && docker load -i scribeowl-stage.tar.gz && docker compose -p scribeowl -f compose.stage.yml up -d --force-recreate && rm scribeowl-stage.tar.gz && docker image prune -f >/dev/null'
           for attempt in $(seq 1 30); do
             if curl --fail --silent --show-error https://scribe.spaces.community/healthz; then
               exit 0
