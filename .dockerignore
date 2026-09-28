@@ -1,0 +1,16 @@
+node_modules
+dist
+build
+.git
+.github
+.githooks
+.claude
+.vscode
+docs
+server
+*.md
+!README.md
+.env
+.env.*
+!.env.example
+*.log
