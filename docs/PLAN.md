@@ -80,7 +80,7 @@
 - Задачи: translate / chat / summary (transcribe от AI-провайдеров больше не нужен).
 
 ## БД (Supabase)
-- Миграция `supabase/migrations/20260925180000_init_schema.sql` применена локально: provider_credentials, ai_task_settings, videos, transcripts, translations, user_videos, chat_messages. RLS везде, клиентам доступ закрыт.
+- Схема и миграции — в серверном репозитории ScribeowlAI_server (`supabase/`, перенесены 2026-09-25). Миграция `20260925180000_init_schema.sql` применена локально: provider_credentials, ai_task_settings, videos, transcripts, translations, user_videos, chat_messages. RLS везде, клиентам доступ закрыт.
 - TODO: новая миграция — transcripts.source → provider_id транскрипт-провайдера; provider_credentials.provider_id + 'transcriptapi'; ai_task_settings.task без 'transcribe'.
 
 ## Порядок работ
