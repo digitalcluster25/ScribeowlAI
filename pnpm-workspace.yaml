@@ -11,3 +11,13 @@ minimumReleaseAgeExclude:
   - '@supabase/realtime-js@2.117.2'
   - '@supabase/storage-js@2.117.2'
   - '@supabase/supabase-js@2.117.2'
+
+# Security patches for dependencies pinned by the extension build toolchain.
+overrides:
+  'msgpackr@<1.10.1': 1.11.5
+  'content-security-policy-parser@<0.6.0': 0.6.0
+  'sharp@<0.35.5': 0.35.5
+  'nanoid@>=5.0.0 <5.1.16': 5.1.16
+  'browserslist@<4.28.7': 4.28.7
+  'vue@>=3.0.0 <3.5.42': 3.5.42
+  '@vue/server-renderer@>=3.0.0 <3.5.42': 3.5.42
