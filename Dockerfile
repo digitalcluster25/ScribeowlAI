@@ -1,6 +1,6 @@
 # Frontend (Vite SPA) → статика в nginx. Переменные VITE_* подставляются при сборке (как локально из .env.local),
 # в CI — из GitHub Secrets (см. .github/workflows/stage.yml).
-FROM node:24-bookworm-slim AS deps
+FROM node:24.22.1-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c AS deps
 WORKDIR /app
 RUN corepack enable && corepack prepare pnpm@12.6.0 --activate
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
